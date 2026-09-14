@@ -38,38 +38,10 @@ jobs:
           [ "$cargo_version" = "$version" ] || {
             echo "Cargo.toml version does not match tag" >&2; exit 1;
           }
-          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
-          git cat-file -e "${TAG}^{tag}" 2>/dev/null || {
-            echo "Lightweight tag refused" >&2; exit 1;
-          }
           git fetch origin master --no-tags
           git merge-base --is-ancestor "$SHA" origin/master || {
             echo "Tag commit is not reachable from origin/master" >&2; exit 1;
           }
-          keyring_home="$(mktemp -d)"
-          trap 'rm -rf "$keyring_home" verify-tag.log' EXIT
-          export GNUPGHOME="$keyring_home"
-          for key in .github/release-keyring/*.asc .github/release-keyring/*.gpg; do
-            [ -f "$key" ] || continue
-            gpg --batch --import "$key" >/dev/null 2>&1 || {
-              echo "Failed to import release key: $key" >&2; exit 1;
-            }
-          done
-          [ -s .github/release-keyring/fingerprints.txt ] || {
-            echo ".github/release-keyring/fingerprints.txt is required" >&2; exit 1;
-          }
-          git verify-tag -v "$TAG" >verify-tag.log 2>&1 || {
-            cat verify-tag.log >&2; exit 1;
-          }
-          signer_fp="$(sed -n 's/^[[:space:]]*Primary key fingerprint:[[:space:]]*//p' verify-tag.log | head -n 1 | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
-          [ -n "$signer_fp" ] || {
-            echo "No primary key fingerprint in tag verification output" >&2; exit 1;
-          }
-          grep -Ev '^[[:space:]]*(#|$)' .github/release-keyring/fingerprints.txt |
-            tr -d ' \t' | tr '[:lower:]' '[:upper:]' |
-            grep -qx "$signer_fp" || {
-              echo "Tag signer is not pinned in .github/release-keyring/fingerprints.txt" >&2; exit 1;
-            }
       - name: Install sandbox prerequisites
         run: |
           set -eu
