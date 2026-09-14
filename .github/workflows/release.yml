@@ -1,8 +1,11 @@
 name: Release
 
+# Legacy release pipeline intentionally disabled. All releases are handled by
+# release-arm64.yml, which publishes the Linux ARM64 binary only.
 on:
   push:
-    tags: ["v*"]
+    branches-ignore: ["**"]
+    tags-ignore: ["**"]
 
 permissions:
   contents: read
