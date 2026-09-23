@@ -134,6 +134,89 @@ pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
         .or_else(|| basename(command))
 }
 
+/// Agents known to be network API clients. Kept in sync with the
+/// per-agent state-path tables in the sandbox backends
+/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`); kimi
+/// binaries are matched by prefix like those tables do.
+const KNOWN_API_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "crush",
+    "grok",
+    "jcode",
+    "pi",
+    "aider",
+    "soulforge",
+    "omp",
+];
+
+fn is_known_api_agent(name: &str) -> bool {
+    KNOWN_API_AGENTS.contains(&name) || name.starts_with("kimi")
+}
+
+/// The hosted-API hostname an agent needs in filtered-egress mode, for
+/// the precise "your allowlist doesn't cover it" warning. Agents not
+/// listed have no canonical host we can name.
+fn api_host(name: &str) -> Option<&'static str> {
+    match name {
+        "claude" => Some("api.anthropic.com"),
+        "codex" => Some("api.openai.com"),
+        "gemini" => Some("generativelanguage.googleapis.com"),
+        "grok" => Some("api.x.ai"),
+        _ => None,
+    }
+}
+
+/// Launch-time warnings for a known API-client agent whose effective
+/// config denies a capability it needs (issue #131): `network` to reach
+/// the model API and `agent_state` for its login/session data. Warning
+/// only -- the launch is never blocked, and unknown commands are silent.
+/// Under `--lockdown` the network warning is suppressed: lockdown blocks
+/// network regardless of config, and it is an explicit hardening choice,
+/// so pointing at `network = true` would mislead. Filtered egress
+/// (`allow_hosts`) counts as network-satisfied, with a precise warning
+/// when the agent's known API host is not covered by the allowlist.
+pub(crate) fn capability_gap_warnings(
+    config: &crate::config::Config,
+) -> Vec<String> {
+    let Some(name) = effective_name(&config.command) else {
+        return Vec::new();
+    };
+    if !is_known_api_agent(name) {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    let filtered =
+        matches!(config.network_mode(), crate::config::NetworkMode::Filtered);
+    if !config.lockdown_enabled() && !config.network_enabled() && !filtered {
+        warnings.push(format!(
+            "ai-jail: `{name}` is a network API client but network is off \
+             (default since v1.18.0) — set `network = true` or pass \
+             --network; see `ai-jail status`"
+        ));
+    }
+    if filtered
+        && let Some(host) = api_host(name)
+        && !crate::proxy::allowlist_matches(config.allow_hosts(), host)
+    {
+        warnings.push(format!(
+            "ai-jail: filtered egress is on but `{name}`'s API host \
+             {host} is not in allow_hosts — add it there or pass \
+             --allow-host {host}; see `ai-jail status`"
+        ));
+    }
+    if !config.agent_state_enabled() {
+        warnings.push(format!(
+            "ai-jail: `{name}` keeps its login/session data under agent \
+             state but agent_state is off — set `agent_state = true` or \
+             pass --agent-state; see `ai-jail status`"
+        ));
+    }
+    warnings
+}
+
 /// Executables that private-home mode must keep visible.
 ///
 /// A managed run needs both the outer ai-memory launcher and the selected
@@ -250,5 +333,113 @@ mod tests {
             assert_eq!(effective_name(&command), Some("ai-memory"));
             assert_eq!(managed_harness(&command), None);
         }
+    }
+
+    fn gap_config(
+        command: &str,
+        network: Option<bool>,
+        agent_state: Option<bool>,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            command: args(&[command]),
+            network,
+            agent_state,
+            ..crate::config::Config::default()
+        }
+    }
+
+    #[test]
+    fn capability_gap_warns_for_claude_with_network_off() {
+        let warnings =
+            capability_gap_warnings(&gap_config("claude", None, Some(true)));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`claude`"));
+        assert!(warnings[0].contains("network is off"));
+        assert!(warnings[0].contains("--network"));
+        assert!(warnings[0].contains("ai-jail status"));
+    }
+
+    #[test]
+    fn capability_gap_warns_for_claude_with_agent_state_off() {
+        let warnings =
+            capability_gap_warnings(&gap_config("claude", Some(true), None));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("agent_state is off"));
+        assert!(warnings[0].contains("--agent-state"));
+    }
+
+    #[test]
+    fn capability_gap_silent_when_capabilities_on() {
+        let warnings = capability_gap_warnings(&gap_config(
+            "claude",
+            Some(true),
+            Some(true),
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn capability_gap_silent_for_unknown_command() {
+        let warnings = capability_gap_warnings(&gap_config("bash", None, None));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn capability_gap_covers_kimi_prefix_and_managed_harness() {
+        let warnings =
+            capability_gap_warnings(&gap_config("kimi-code", None, None));
+        assert_eq!(warnings.len(), 2);
+
+        let mut config = gap_config("ai-memory", Some(true), None);
+        config.command =
+            args(&["ai-memory", "run", "--project", "demo", "codex"]);
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`codex`"));
+        assert!(warnings[0].contains("agent_state is off"));
+    }
+
+    #[test]
+    fn capability_gap_suppresses_network_warning_under_lockdown() {
+        // Lockdown blocks network regardless of config, and it is an
+        // explicit hardening choice -- pointing at `network = true`
+        // would mislead. The agent_state warning still applies.
+        let mut config = gap_config("claude", None, None);
+        config.lockdown = Some(true);
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("agent_state is off"));
+        assert!(!warnings.iter().any(|warning| warning.contains("network")));
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_satisfies_network() {
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["api.anthropic.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+        // Subdomain entries cover the bare host's subdomains too.
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["anthropic.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_names_missing_api_host() {
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["github.com".into()];
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("api.anthropic.com"));
+        assert!(warnings[0].contains("--allow-host"));
+        assert!(!warnings[0].contains("network is off"));
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_silent_without_known_api_host() {
+        // Agents with no canonical API host in the table get no
+        // host-coverage warning in filtered mode.
+        let mut config = gap_config("kimi", None, Some(true));
+        config.allow_hosts = vec!["example.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
     }
 }

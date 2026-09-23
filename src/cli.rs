@@ -60,12 +60,18 @@ OPTIONS:
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; not persisted to .ai-jail)
+    --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
+                                    must be user-owned, mode 0600, outside the project;
+                                    applies like --env, which wins on conflicts)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)
     --update-check / --no-update-check
                                     Enable/disable the status bar's GitHub update
                                     check (default: off)
+    --audit-log / --no-audit-log    Enable/disable the launch audit log at
+                                    ~/.local/share/ai-jail/history.jsonl
+                                    (default: off; project .ai-jail cannot enable)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
@@ -81,6 +87,9 @@ OPTIONS:
     --no-status-bar                Disable persistent status line
     --exec                         Direct execution mode (no PTY proxy, no status bar)
     --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
+    --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
+                                   built-in filtered proxy (repeatable; implies filtered
+                                   network mode; cannot combine with --network)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -128,10 +137,13 @@ pub struct CliArgs {
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
+    pub allow_hosts: Vec<String>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
+    pub audit_log: Option<bool>,
+    pub env_from_file: Vec<PathBuf>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -143,6 +155,13 @@ pub struct CliArgs {
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
+    /// Internal: run the in-sandbox proxy bridge (filtered egress),
+    /// as (loopback port, outer proxy's Unix socket path). Spawned by
+    /// the --landlock-exec wrapper before it restricts itself.
+    pub proxy_bridge: Option<(u16, PathBuf)>,
+    /// Internal: loopback port the wrapper's proxy bridge should listen
+    /// on; only valid with --landlock-exec.
+    pub proxy_bridge_port: Option<u16>,
     /// Internal: opaque read-write mount destinations for Landlock.
     pub landlock_rw_paths: Vec<PathBuf>,
     /// Internal: opaque read-only mount destinations for Landlock.
@@ -256,6 +275,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     .map_err(|_| format!("invalid port number: {val}"))?;
                 args.allow_tcp_ports.push(port);
             }
+            Long("allow-host") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let host = val.to_string_lossy();
+                if host.is_empty() {
+                    return Err("--allow-host requires a non-empty host".into());
+                }
+                args.allow_hosts.push(host.into_owned());
+            }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 args.claude_dir =
@@ -300,6 +327,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("update-check" | "no-update-check")) => {
                 args.update_check = Some(s == "update-check");
             }
+            Long(s @ ("audit-log" | "no-audit-log")) => {
+                args.audit_log = Some(s == "audit-log");
+            }
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -310,6 +340,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     );
                 }
                 args.env.push(s.into_owned());
+            }
+            Long("env-from-file") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let path = val.to_string_lossy();
+                if path.is_empty() {
+                    return Err(
+                        "--env-from-file requires a non-empty path".into()
+                    );
+                }
+                args.env_from_file.push(PathBuf::from(path.into_owned()));
             }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
@@ -371,6 +411,30 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.status_bar = Some(false);
             }
             Long("landlock-exec") => args.landlock_exec = true,
+            Long("proxy-bridge") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text.parse().map_err(|_| {
+                    format!("invalid proxy bridge port: {port_text}")
+                })?;
+                let sock: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.proxy_bridge = Some((port, sock));
+            }
+            Long("proxy-bridge-port") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--proxy-bridge-port is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text.parse().map_err(|_| {
+                    format!("invalid proxy bridge port: {port_text}")
+                })?;
+                args.proxy_bridge_port = Some(port);
+            }
             Long("landlock-rw-path") => {
                 if !args.landlock_exec {
                     return Err(
@@ -484,6 +548,7 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--deny-path-except"
             | "--hide-dotdir"
             | "--allow-tcp-port"
+            | "--allow-host"
             | "--systemd-user"
             | "--no-systemd-user"
             | "--worktree"
@@ -503,7 +568,10 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--no-inherit-env"
             | "--update-check"
             | "--no-update-check"
+            | "--audit-log"
+            | "--no-audit-log"
             | "--env"
+            | "--env-from-file"
             | "--mise"
             | "--no-mise"
             | "--save-config"
@@ -1378,6 +1446,110 @@ mod tests {
     #[test]
     fn parse_allow_tcp_port_missing_value() {
         assert!(parse_test(&["--allow-tcp-port"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_host_single() {
+        let args = parse_test(&["--allow-host", "api.anthropic.com", "claude"])
+            .unwrap();
+        assert_eq!(args.allow_hosts, vec!["api.anthropic.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_allow_host_repeatable() {
+        let args = parse_test(&[
+            "--allow-host",
+            "api.anthropic.com",
+            "--allow-host=github.com",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_allow_host_missing_value() {
+        assert!(parse_test(&["--allow-host"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_host_after_command_rejected() {
+        let error =
+            parse_test(&["claude", "--allow-host=example.com"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_proxy_bridge_internal_mode() {
+        let args = parse_test(&[
+            "--proxy-bridge",
+            "15919",
+            "/tmp/.ai-jail-proxy.sock",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.proxy_bridge,
+            Some((15919, PathBuf::from("/tmp/.ai-jail-proxy.sock")))
+        );
+        assert!(parse_test(&["--proxy-bridge", "nope", "/tmp/s"]).is_err());
+        assert!(parse_test(&["--proxy-bridge", "15919"]).is_err());
+    }
+
+    #[test]
+    fn parse_proxy_bridge_port_requires_landlock_exec() {
+        assert!(parse_test(&["--proxy-bridge-port", "15919"]).is_err());
+        let args = parse_test(&[
+            "--landlock-exec",
+            "--proxy-bridge-port",
+            "15919",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.proxy_bridge_port, Some(15919));
+    }
+
+    #[test]
+    fn parse_audit_log_flag_pair() {
+        let args = parse_test(&["--audit-log", "bash"]).unwrap();
+        assert_eq!(args.audit_log, Some(true));
+        let args = parse_test(&["--no-audit-log", "bash"]).unwrap();
+        assert_eq!(args.audit_log, Some(false));
+        let error = parse_test(&["claude", "--audit-log"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_env_from_file_repeatable() {
+        let args = parse_test(&[
+            "--env-from-file",
+            "/run/secrets/anthropic",
+            "--env-from-file=/run/secrets/openai",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.env_from_file,
+            vec![
+                PathBuf::from("/run/secrets/anthropic"),
+                PathBuf::from("/run/secrets/openai"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_from_file_missing_value() {
+        assert!(parse_test(&["--env-from-file"]).is_err());
+    }
+
+    #[test]
+    fn parse_env_from_file_after_command_rejected() {
+        let error =
+            parse_test(&["claude", "--env-from-file=/tmp/keys"]).unwrap_err();
+        assert!(error.contains("after command"));
     }
 
     #[test]

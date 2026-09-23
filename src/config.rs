@@ -228,6 +228,13 @@ pub struct Config {
     pub systemd_user: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tcp_ports: Vec<u16>,
+    /// Hosts reachable through the filtered-egress CONNECT proxy
+    /// (docs/connect-proxy-plan.md). A non-empty list selects filtered
+    /// network mode; an entry matches the host itself and its
+    /// subdomains. The untrusted project `.ai-jail` may only shrink
+    /// this list, never grow it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -250,6 +257,13 @@ pub struct Config {
     /// entries can carry secret values.
     #[serde(default, skip_serializing)]
     pub env_pass: Vec<String>,
+    /// Credential files read like `--env` entries (`KEY=VALUE` lines).
+    /// Each file must exist, be a user-owned regular file (not a
+    /// symlink), mode 0600 or stricter, and live outside the project
+    /// directory. Trusted layers only — the project `.ai-jail` is
+    /// ignored. Never serialized: the paths point at secret material.
+    #[serde(default, skip_serializing)]
+    pub env_from_file: Vec<PathBuf>,
     /// Directories whose project `.ai-jail` is trusted to grant
     /// capabilities, instead of being treated as untrusted monotonic
     /// policy. A project matches when it is one of these directories or
@@ -266,6 +280,12 @@ pub struct Config {
     /// `.ai-jail` may only disable it, never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
+    /// Opt-in launch audit log at `~/.local/share/ai-jail/history.jsonl`
+    /// (phase 5 of docs/connect-proxy-plan.md). Enabling writes a host
+    /// file, so the untrusted project `.ai-jail` may only disable it,
+    /// never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -274,6 +294,17 @@ struct GlobalConfig {
     base: Config,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     commands: BTreeMap<String, Config>,
+}
+
+/// Effective network posture of a launch (docs/connect-proxy-plan.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    /// No network (default).
+    Off,
+    /// CONNECT-only egress to `allow_hosts` via the built-in proxy.
+    Filtered,
+    /// Unrestricted network (`network = true` / `--network`).
+    Full,
 }
 
 impl Config {
@@ -376,6 +407,23 @@ impl Config {
     pub fn allow_tcp_ports(&self) -> &[u16] {
         &self.allow_tcp_ports
     }
+    pub fn allow_hosts(&self) -> &[String] {
+        &self.allow_hosts
+    }
+    /// Effective network posture: `network = true` wins as unrestricted,
+    /// a non-empty `allow_hosts` selects filtered egress through the
+    /// CONNECT proxy, otherwise networking stays off. The
+    /// Full-plus-allow_hosts contradiction is a launch error, checked in
+    /// main (`validate_network_flags`).
+    pub fn network_mode(&self) -> NetworkMode {
+        if self.network_enabled() {
+            NetworkMode::Full
+        } else if !self.allow_hosts.is_empty() {
+            NetworkMode::Filtered
+        } else {
+            NetworkMode::Off
+        }
+    }
     /// Command-specific agent state mounts (`~/.claude`, `~/.codex`,
     /// `~/.claude.json`, ...) are a trusted capability: disabled
     /// unless explicitly enabled via CLI or global config.
@@ -395,6 +443,10 @@ impl Config {
     /// disabled unless explicitly enabled via CLI or global config.
     pub fn update_check_enabled(&self) -> bool {
         self.update_check == Some(true)
+    }
+    /// Opt-in launch audit log: off unless explicitly enabled.
+    pub fn audit_log_enabled(&self) -> bool {
+        self.audit_log == Some(true)
     }
 }
 
@@ -473,6 +525,107 @@ pub fn apply_env_pass(
             env.push((name.to_string(), value));
         }
     }
+}
+
+/// Load `--env-from-file` credential files into `NAME=VALUE` env_pass
+/// entries. Every refusal here is a launch error, not a warning: this
+/// is credential material, so it fails closed.
+pub fn load_env_files(
+    paths: &[PathBuf],
+    project_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = to_absolute(path.clone(), project_dir);
+        validate_env_file(&absolute, project_dir)?;
+        let content = std::fs::read_to_string(&absolute).map_err(|e| {
+            format!("--env-from-file {}: {e}", absolute.display())
+        })?;
+        parse_env_file(&content, &absolute, &mut entries)?;
+    }
+    Ok(entries)
+}
+
+/// A credential file must be an existing, user-owned regular file,
+/// mode 0600 or stricter, reached without symlinks, living outside the
+/// project directory.
+fn validate_env_file(path: &Path, project_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let label = || format!("--env-from-file {}", path.display());
+    // lstat, not stat: a symlink is refused, never followed.
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("{}: {e}", label()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{}: is a symlink; credential files are never followed through links",
+            label()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{}: not a regular file", label()));
+    }
+    let euid = unsafe { nix::libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(format!("{}: must be owned by the current user", label()));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{}: must be mode 0600 or stricter (is {:04o})",
+            label(),
+            mode
+        ));
+    }
+    if resolves_inside_project(path, project_dir) {
+        return Err(format!(
+            "{}: credential files must live outside the project directory",
+            label()
+        ));
+    }
+    Ok(())
+}
+
+/// Strict `KEY=VALUE` lines: `#` comments and blank lines are skipped,
+/// keys must match `[A-Za-z_][A-Za-z0-9_]*` (no `export` prefix), and
+/// values are used verbatim after the first `=` -- no quote stripping.
+fn parse_env_file(
+    content: &str,
+    path: &Path,
+    entries: &mut Vec<String>,
+) -> Result<(), String> {
+    for (lineno, line) in content.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "--env-from-file {}:{}: not a KEY=VALUE line",
+                path.display(),
+                lineno + 1
+            ));
+        };
+        if !valid_env_key(key) {
+            return Err(format!(
+                "--env-from-file {}:{}: invalid variable name {key:?}",
+                path.display(),
+                lineno + 1
+            ));
+        }
+        entries.push(format!("{key}={value}"));
+    }
+    Ok(())
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The sandbox environment for normal mode when full inheritance is
@@ -728,11 +881,17 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(agent_state);
     take!(inherit_env);
     take!(update_check);
+    take!(audit_log);
     c.env_pass.extend(local.env_pass);
     dedup_strings(&mut c.env_pass);
+    c.env_from_file.extend(local.env_from_file);
+    dedup_paths(&mut c.env_from_file);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
+    // Trusted layers union the filtered-egress allowlist.
+    c.allow_hosts.extend(local.allow_hosts);
+    dedup_strings(&mut c.allow_hosts);
     take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
@@ -1066,9 +1225,16 @@ pub fn merge_with_global_report(
     monotonic!(inherit_env, |config: &Config| config.inherit_env_enabled());
     monotonic!(update_check, |config: &Config| config
         .update_check_enabled());
+    monotonic!(audit_log, |config: &Config| config.audit_log_enabled());
     if !local.env_pass.is_empty() {
         warnings.push(
             "project .ai-jail env_pass ignored (use --env or global config)"
+                .into(),
+        );
+    }
+    if !local.env_from_file.is_empty() {
+        warnings.push(
+            "project .ai-jail env_from_file ignored (use --env-from-file or global config)"
                 .into(),
         );
     }
@@ -1096,6 +1262,20 @@ pub fn merge_with_global_report(
                 .map(u16::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    }
+    // Filtered egress is shrink-only from an untrusted project: entries
+    // already in the baseline survive (the project may narrow by
+    // omission), anything new is dropped with a warning.
+    let dropped_hosts: Vec<_> = local
+        .allow_hosts
+        .into_iter()
+        .filter(|host| !c.allow_hosts.contains(host))
+        .collect();
+    if !dropped_hosts.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail allow_hosts ignored: {}",
+            dropped_hosts.join(", ")
         ));
     }
     if local.claude_dir.is_some() {
@@ -1507,6 +1687,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(agent_state);
     direct!(inherit_env);
     direct!(update_check);
+    direct!(audit_log);
     invert!(mise, no_mise);
     invert!(save_config, no_save_config);
     invert!(hide_config, no_hide_config);
@@ -1529,8 +1710,16 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.allow_tcp_ports.sort_unstable();
     config.allow_tcp_ports.dedup();
 
+    config.allow_hosts.extend(cli.allow_hosts.iter().cloned());
+    dedup_strings(&mut config.allow_hosts);
+
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
+
+    config
+        .env_from_file
+        .extend(cli.env_from_file.iter().cloned());
+    dedup_paths(&mut config.env_from_file);
 
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
@@ -1559,6 +1748,7 @@ fn expand_user_paths(config: &mut Config) {
     expand_tilde_vec(&mut config.deny_paths);
     expand_tilde_vec(&mut config.mask_exceptions);
     expand_tilde_vec(&mut config.deny_path_exceptions);
+    expand_tilde_vec(&mut config.env_from_file);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
@@ -1629,7 +1819,7 @@ pub fn display_status(config: &Config) {
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_opt_in_tristate("  Display", config.no_display);
     print_opt_in_enabled("  Audio", config.audio);
-    print_opt_in_enabled("  Network", config.network);
+    print_network_mode(config);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
@@ -1637,7 +1827,9 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Agent state", config.agent_state);
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     print_string_list("  Env passthrough", &config.env_pass);
+    print_path_list("  Env from file", &config.env_from_file);
     print_opt_in_enabled("  Update check", config.update_check);
+    print_opt_in_enabled("  Audit log", config.audit_log);
     print_opt_in_tristate("  Git worktree", config.no_worktree);
     print_auto_tristate("  Mise", config.no_mise);
     print_default_on_tristate("  Save config", config.no_save_config);
@@ -1776,6 +1968,20 @@ fn print_allow_tcp_ports(ports: &[u16], lockdown: bool) {
         " (only effective in lockdown mode)"
     };
     output::status_header("  Allow TCP ports", &format!("{joined}{note}"));
+}
+
+fn print_network_mode(config: &Config) {
+    let v = match config.network_mode() {
+        NetworkMode::Full => "enabled".to_string(),
+        NetworkMode::Filtered => {
+            format!("filtered ({} hosts)", config.allow_hosts.len())
+        }
+        NetworkMode::Off => "disabled".to_string(),
+    };
+    output::status_header("  Network", &v);
+    if config.network_mode() == NetworkMode::Filtered {
+        print_string_list("  Allow hosts", &config.allow_hosts);
+    }
 }
 
 #[cfg(test)]
@@ -2943,12 +3149,15 @@ no_gpu = true
             no_rlimits: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
+            allow_hosts: vec!["api.anthropic.com".into()],
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
+            env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
             trust_project_config: vec![],
             update_check: Some(false),
+            audit_log: Some(true),
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -2978,6 +3187,7 @@ no_gpu = true
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
         assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
+        assert_eq!(deserialized.allow_hosts, config.allow_hosts);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -2987,7 +3197,11 @@ no_gpu = true
         // Deserialization of hand-written `env_pass` is covered by
         // parse tests.
         assert!(deserialized.env_pass.is_empty());
+        // env_from_file is likewise never serialized: the paths point
+        // at credential material and must not land in a config file.
+        assert!(deserialized.env_from_file.is_empty());
         assert_eq!(deserialized.update_check, config.update_check);
+        assert_eq!(deserialized.audit_log, config.audit_log);
     }
 
     #[test]
@@ -3870,6 +4084,392 @@ allow_tcp_ports = [32000, 8080]
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.allow_tcp_ports, vec![32000, 8080]);
+    }
+
+    #[test]
+    fn parse_config_with_allow_hosts() {
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com", "github.com"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn regression_v1_22_0_config_without_allow_hosts() {
+        // Configs written before allow_hosts existed must still parse,
+        // defaulting to an empty list (network mode unchanged).
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+hide_dotdirs = []
+mask = []
+deny_paths = []
+no_gpu = false
+no_docker = false
+no_display = false
+lockdown = false
+no_landlock = false
+no_seccomp = false
+no_rlimits = false
+allow_tcp_ports = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.allow_hosts.is_empty());
+        assert_eq!(cfg.network_mode(), NetworkMode::Off);
+    }
+
+    #[test]
+    fn network_mode_resolution() {
+        assert_eq!(Config::default().network_mode(), NetworkMode::Off);
+        assert_eq!(
+            Config {
+                allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Filtered
+        );
+        assert_eq!(
+            Config {
+                network: Some(true),
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Full
+        );
+        // The contradictory combination resolves Full here; it is a
+        // hard launch error via validate_network_flags in main.
+        assert_eq!(
+            Config {
+                network: Some(true),
+                allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Full
+        );
+    }
+
+    #[test]
+    fn merge_allow_hosts_from_cli() {
+        let existing = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            allow_hosts: vec!["github.com".into(), "api.anthropic.com".into()],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_allow_hosts_trusted_union() {
+        let global = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let local = Config {
+            allow_hosts: vec!["github.com".into(), "api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_allow_hosts_shrinks_silently() {
+        // A project may narrow the baseline by omission or subset.
+        let baseline = Config {
+            allow_hosts: vec!["api.anthropic.com".into(), "github.com".into()],
+            ..Config::default()
+        };
+        let project = Config {
+            allow_hosts: vec!["github.com".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+        assert!(!warnings.iter().any(|w| w.contains("allow_hosts")));
+    }
+
+    #[test]
+    fn project_allow_hosts_cannot_extend_baseline() {
+        let baseline = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let project = Config {
+            allow_hosts: vec!["api.anthropic.com".into(), "evil.com".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(merged.allow_hosts, vec!["api.anthropic.com".to_string()]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
+        );
+    }
+
+    #[test]
+    fn regression_v1_22_0_config_without_audit_log() {
+        // Configs written before audit_log existed must still parse,
+        // defaulting the audit log to off.
+        let toml = r#"
+command = ["claude"]
+lockdown = false
+update_check = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.audit_log, None);
+        assert!(!cfg.audit_log_enabled());
+    }
+
+    #[test]
+    fn project_cannot_enable_audit_log_but_may_disable() {
+        // Enabling writes a host file: a capability the untrusted
+        // project layer never gets.
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            Config {
+                audit_log: Some(true),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(!merged.audit_log_enabled());
+        assert!(warnings.iter().any(|w| w.contains("audit_log")));
+
+        let (merged, warnings) = merge_with_global_report(
+            Config {
+                audit_log: Some(true),
+                ..Config::default()
+            },
+            Config {
+                audit_log: Some(false),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(!merged.audit_log_enabled());
+        assert!(!warnings.iter().any(|w| w.contains("audit_log")));
+    }
+
+    #[test]
+    fn regression_v1_22_0_config_without_env_from_file() {
+        // Configs written before env_from_file existed must still
+        // parse, defaulting to no credential files.
+        let toml = r#"
+command = ["claude"]
+env_pass = ["ANTHROPIC_API_KEY"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.env_from_file.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_env_from_file() {
+        let toml = r#"
+command = ["claude"]
+env_from_file = ["/run/secrets/anthropic"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.env_from_file,
+            vec![PathBuf::from("/run/secrets/anthropic")]
+        );
+    }
+
+    #[test]
+    fn project_env_from_file_is_ignored_with_warning() {
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            Config {
+                env_from_file: vec![PathBuf::from("keys")],
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(merged.env_from_file.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("env_from_file")));
+    }
+
+    #[test]
+    fn merge_env_from_file_trusted_union_and_cli() {
+        let global = Config {
+            env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
+            ..Config::default()
+        };
+        let command_table = Config {
+            env_from_file: vec![PathBuf::from("/run/secrets/openai")],
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, command_table);
+        assert_eq!(
+            merged.env_from_file,
+            vec![
+                PathBuf::from("/run/secrets/anthropic"),
+                PathBuf::from("/run/secrets/openai"),
+            ]
+        );
+
+        let cli = CliArgs {
+            env_from_file: vec![PathBuf::from("/run/secrets/grok")],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, merged);
+        assert_eq!(merged.env_from_file.len(), 3);
+    }
+
+    fn env_file_fixture(name: &str, content: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-env-file-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = root.join(name);
+        std::fs::write(&file, content).unwrap();
+        std::fs::set_permissions(
+            &file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn env_from_file_parses_strict_key_value_lines() {
+        let (root, file) = env_file_fixture(
+            "parse",
+            "# comment\n\nAPI_KEY=sk-123\nEMPTY=\nURL=https://x?a=b&c=d\nQUOTED=\"keep me\"\n",
+        );
+        let entries = load_env_files(&[file], &root.join("project")).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                "API_KEY=sk-123".to_string(),
+                "EMPTY=".to_string(),
+                // Verbatim after the first '=': no quote stripping.
+                "URL=https://x?a=b&c=d".to_string(),
+                "QUOTED=\"keep me\"".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_from_file_rejects_bad_lines_and_keys() {
+        for (name, content) in [
+            ("no-eq", "JUST_A_NAME\n"),
+            ("bad-key", "1KEY=value\n"),
+            ("export", "export KEY=value\n"),
+            ("spaced-key", "KEY WITH SPACE=value\n"),
+            ("empty-key", "=value\n"),
+        ] {
+            let (root, file) = env_file_fixture(name, content);
+            assert!(
+                load_env_files(&[file], &root.join("project")).is_err(),
+                "{name} must fail closed"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn env_from_file_refuses_unsafe_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Missing file.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-env-file-missing-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(load_env_files(&[root.join("nope")], &project).is_err());
+
+        // Loose permissions.
+        let (root, file) = env_file_fixture("loose", "A=1\n");
+        std::fs::set_permissions(&file, PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(load_env_files(&[file], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Symlink.
+        let (root, file) = env_file_fixture("linked", "A=1\n");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(load_env_files(&[link], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Inside the project directory.
+        let (root, file) = env_file_fixture("outside", "A=1\n");
+        let inside = root.join("project").join("keys");
+        std::fs::write(&inside, "A=1\n").unwrap();
+        std::fs::set_permissions(&inside, PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let result = load_env_files(&[inside], &root.join("project"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("outside the project"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = file;
+
+        // Not a regular file.
+        let (root, _file) = env_file_fixture("regular", "A=1\n");
+        let dir = root.join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(load_env_files(&[dir], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Not owned by the current user (root-owned system file; skip
+        // when absent or when running as root).
+        let system = PathBuf::from("/etc/shadow");
+        let euid = unsafe { nix::libc::geteuid() };
+        if euid != 0
+            && let Ok(metadata) = std::fs::symlink_metadata(&system)
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != euid {
+                let (root, _file) = env_file_fixture("owned", "A=1\n");
+                let result = load_env_files(&[system], &root.join("project"));
+                assert!(result.is_err());
+                assert!(
+                    result.unwrap_err().contains("owned by the current user")
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn env_from_file_entries_yield_to_env_flag() {
+        // apply_env_pass replaces earlier values with later ones, so
+        // file entries first + --env entries after = --env wins.
+        let (root, file) = env_file_fixture("precedence", "TOKEN=file-value\n");
+        let file_entries =
+            load_env_files(&[file], &root.join("project")).unwrap();
+        let mut env: Vec<(String, String)> = Vec::new();
+        apply_env_pass(&mut env, &file_entries, &[]);
+        apply_env_pass(&mut env, &["TOKEN=cli-value".to_string()], &[]);
+        assert_eq!(env, vec![("TOKEN".to_string(), "cli-value".to_string())]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4901,12 +5501,15 @@ hide_dotdirs = [".my_secrets"]
             no_rlimits: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
+            allow_hosts: vec![],
             claude_dir: None,
             agent_state: None,
             inherit_env: None,
             env_pass: vec![],
+            env_from_file: vec![],
             trust_project_config: vec![],
             update_check: None,
+            audit_log: None,
         };
         save(&config);
 

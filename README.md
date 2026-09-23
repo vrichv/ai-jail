@@ -1,5 +1,7 @@
 # ai-jail
 
+**[aijail.io](https://aijail.io)**
+
 `ai-jail` runs AI coding agents in an OS sandbox: bubblewrap plus Landlock,
 seccomp, and limits on Linux; `sandbox-exec` on macOS. It is a useful layer,
 not a replacement for a disposable VM when running hostile code.
@@ -87,24 +89,36 @@ worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd
 user bus are also off by default.
 
-| Flag pair                                              | Effect and security consequence                                                                                                                                                                |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                     |
-| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                            |
-| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                       |
-| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                |
+| Flag pair                                              | Effect and security consequence                                                                                                                                                                  |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                       |
+| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                              |
+| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                         |
+| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                  |
 | `--audio` / `--no-audio`                               | Enables/disables host audio (Linux only). Binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` plus `/dev/snd`; anything in the sandbox can record and play audio while enabled. |
-| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                    |
-| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                             |
-| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                    |
-| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                              |
-| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).      |
-| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                     |
-| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only. |
-| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                             |
+| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                      |
+| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                               |
+| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                      |
+| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                |
+| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).        |
+| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                       |
+| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.   |
+| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                               |
+
+`--allow-host HOST` (repeatable, or `allow_hosts = [...]` in `.ai-jail`)
+enables filtered egress instead: the sandbox keeps no route off the host
+except a built-in CONNECT proxy that dials exactly the listed hosts — an
+entry matches the host itself and its subdomains. On Linux the fence is a
+private network namespace whose only reachable endpoint is an in-sandbox
+bridge; on macOS it is a seatbelt endpoint rule allowing outbound only to
+the proxy's loopback port. It is TCP/CONNECT-only:
+no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
+resolver is not fenced). It cannot combine with `--network` or `--browser`,
+and a project `.ai-jail` may only shrink the list, never grow it.
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
-fails closed because UDP cannot be securely constrained through this option.
+fails closed because UDP cannot be securely constrained through this option —
+use `--allow-host` for filtered egress instead.
 Use `--network` only when unrestricted network access is explicitly desired.
 
 `--docker` mounts an actual Unix Docker socket and is effectively host-root:
@@ -143,6 +157,19 @@ env_pass = ["ANTHROPIC_BASE_URL"]
 `[commands.<name>]` tables, and ignored in a project `.ai-jail`, since a
 repository must not be able to pull variables out of your shell. It is also
 never written back to disk, because `NAME=VALUE` entries can carry secrets.
+
+### Credential hygiene: `--env-from-file`
+
+For API keys and similar secrets, keep them out of every `.ai-jail` file:
+pass them from the host environment via `--env NAME`, or from a 0600 file
+via `--env-from-file PATH` (repeatable; also `env_from_file` in the global
+config). Each file must be user-owned, a regular file (never a symlink),
+mode 0600 or stricter, and live outside the project directory — any
+violation fails the launch. The format is strict `KEY=VALUE` lines (`#`
+comments and blank lines are skipped; no `export` prefix, no quote
+stripping). Entries apply like `--env`, and `--env` wins on conflicts.
+Auto-save strips them, but don't rely on it: write secrets into files or
+your shell, never into config.
 
 ## Project secrets
 

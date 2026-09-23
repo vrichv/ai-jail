@@ -1170,17 +1170,29 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
 /// ai-jail is proxying a PTY. macOS scopes its terminal `file-ioctl` grant to
 /// that exact device; Linux does not need it, because seccomp denies TIOCSTI
 /// outright there.
+///
+/// `proxy` is the running filtered-egress proxy, when the launch is in
+/// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
+/// macOS points its seatbelt endpoint rule and the child env at its
+/// loopback TCP port.
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
     sandbox_tty: Option<&Path>,
+    proxy: Option<&crate::proxy::Proxy>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
         let _ = sandbox_tty;
-        bwrap::build(guard, config, project_dir, verbose)
+        bwrap::build(
+            guard,
+            config,
+            project_dir,
+            verbose,
+            proxy.and_then(|p| p.unix_path()),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -1191,6 +1203,7 @@ pub fn build(
             project_dir,
             verbose,
             sandbox_tty,
+            proxy.map(|p| p.port()),
         ))
     }
 }
@@ -1200,16 +1213,28 @@ pub fn dry_run(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    proxy: Option<&crate::proxy::Proxy>,
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
-        bwrap::dry_run(guard, config, project_dir, verbose)
+        bwrap::dry_run(
+            guard,
+            config,
+            project_dir,
+            verbose,
+            proxy.and_then(|p| p.unix_path()),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
         let prepared = prepare_seatbelt_config(config)?;
-        Ok(seatbelt::dry_run(&prepared, project_dir, verbose))
+        Ok(seatbelt::dry_run(
+            &prepared,
+            project_dir,
+            verbose,
+            proxy.map(|p| p.port()),
+        ))
     }
 }
 

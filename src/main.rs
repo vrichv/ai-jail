@@ -1,12 +1,14 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("ai-jail only supports Linux and macOS");
 
+mod audit;
 mod bootstrap;
 mod cli;
 mod command;
 mod config;
 mod fsutil;
 mod output;
+mod proxy;
 mod pty;
 mod sandbox;
 mod signals;
@@ -73,6 +75,23 @@ fn apply_browser_profile(config: &mut config::Config) {
     config.no_status_bar = Some(true);
 }
 
+/// Network-mode contradiction checks, all fail-closed at launch.
+/// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
+/// strictly better answer, docs/connect-proxy-plan.md), and filtered
+/// egress combines with neither unrestricted network nor browser mode.
+fn validate_network_flags(config: &config::Config) -> Result<(), String> {
+    if !config.allow_tcp_ports().is_empty() {
+        return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
+    }
+    if config.network_enabled() && !config.allow_hosts().is_empty() {
+        return Err("--network and --allow-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
+    }
+    if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
+        return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
+    }
+    Ok(())
+}
+
 /// Detect a terminal multiplexer around the current process. Nested
 /// PTYs (tmux/zellij PTY → ai-jail vt100 PTY → child) conflict over
 /// resize, keyboard protocol, and status-bar drawing, so we auto-skip
@@ -111,6 +130,20 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // Idempotent: parent absolutized before serializing wrapper args,
     // but re-running guarantees no relative path reaches landlock.
     config::absolutize_user_paths(&mut config, &project_dir);
+
+    // Filtered egress (Linux): spawn the in-sandbox bridge BEFORE
+    // apply_landlock/apply_seccomp below. Both restrict the caller and
+    // its future children only, so an already-spawned bridge process
+    // stays unrestricted -- it needs loopback listen plus Unix connect,
+    // neither of which the sandbox policy would grant. The bridge dies
+    // with the sandbox: it sits in the private pid namespace bwrap
+    // created (--unshare-pid), and the kernel kills every namespace
+    // member when the namespace init -- this process, after the exec
+    // below -- exits.
+    #[cfg(target_os = "linux")]
+    if let Some(port) = cli.proxy_bridge_port {
+        spawn_proxy_bridge(port)?;
+    }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
     // Hidden path flags preserve destinations atomically, including ':'.
@@ -161,6 +194,31 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         .exec();
 
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
+}
+
+/// Spawn the in-sandbox proxy bridge as a child of the landlock
+/// wrapper. Fatal on spawn failure: without the bridge, filtered egress
+/// silently means "no egress at all", which is not what the launch
+/// asked for. The child is never reaped or waited on -- it lives
+/// exactly as long as the sandbox's pid namespace (see the call site).
+#[cfg(target_os = "linux")]
+fn spawn_proxy_bridge(port: u16) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| {
+        format!("Cannot resolve ai-jail binary for the proxy bridge: {e}")
+    })?;
+    std::process::Command::new(exe)
+        .args([
+            "--proxy-bridge",
+            port.to_string().as_str(),
+            proxy::IN_SANDBOX_SOCK_PATH,
+        ])
+        // The internal-mode marker --proxy-bridge refuses to run
+        // without; an agent that can already reach the proxy socket
+        // gains nothing by setting it itself.
+        .env("AI_JAIL_PROXY_BRIDGE", "1")
+        .spawn()
+        .map_err(|e| format!("Failed to spawn the proxy bridge: {e}"))?;
+    Ok(())
 }
 
 /// Drop `PATH` entries that are not directories here, returning the rewritten
@@ -254,6 +312,21 @@ fn run() -> Result<i32, String> {
         return run_landlock_exec(&cli);
     }
 
+    // Internal: the in-sandbox filtered-egress bridge (spawned by the
+    // landlock wrapper, which sets the marker env var; top-level
+    // invocation is refused). Prints nothing; quiet mode needs no
+    // handling.
+    if cli.proxy_bridge.is_some()
+        && std::env::var_os("AI_JAIL_PROXY_BRIDGE").is_none()
+    {
+        return Err(
+            "--proxy-bridge is an internal mode, not a launch option".into()
+        );
+    }
+    if let Some((port, socket)) = &cli.proxy_bridge {
+        return proxy::run_bridge(*port, socket).map(|()| 0);
+    }
+
     // Load local (./.ai-jail), then command-aware global ($HOME/.ai-jail), merge
     let project_config = if cli.clean {
         config::Config::default()
@@ -295,15 +368,20 @@ fn run() -> Result<i32, String> {
     for warning in security_warnings {
         output::security_warn(&warning);
     }
+    // Capability gaps for known API-client agents (issue #131): warn at
+    // launch so an upgrade that flips a default does not fail silently.
+    // `output::warn` respects --exec quiet mode like other non-security
+    // warnings; the launch itself is never blocked.
+    for warning in command::capability_gap_warnings(&config) {
+        output::warn(&warning);
+    }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
     // #54). Done here so display_status and the --init save path see
     // the same canonical paths the sandbox will use.
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config);
-    if !config.allow_tcp_ports().is_empty() {
-        return Err("--allow-tcp-port is disabled because UDP cannot be isolated; use explicit --network for unrestricted network access".into());
-    }
+    validate_network_flags(&config)?;
 
     // Handle status command
     if cli.status {
@@ -340,14 +418,84 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
+    // credential files. Entries apply exactly like --env, and on a
+    // conflict the --env entry wins (closest to the user), so the file
+    // entries come first; apply_env_pass replaces earlier values with
+    // later ones. Forced setenvs (the filtered-egress proxy vars) are
+    // applied after all of this and still win. This runs after the
+    // status/init/bootstrap early returns so secret values never reach
+    // `ai-jail status` output.
+    if !config.env_from_file.is_empty() {
+        let file_entries =
+            config::load_env_files(&config.env_from_file, &invocation_cwd)?;
+        let mut env_pass = file_entries;
+        env_pass.extend(config.env_pass.iter().cloned());
+        config.env_pass = env_pass;
+    }
+
     // Check sandbox tool is available
     sandbox::check()?;
 
     // Platform-specific info messages (e.g. no-op flags on macOS)
     sandbox::platform_notes(&config);
 
+    // Opt-in launch audit log (phase 5 of docs/connect-proxy-plan.md):
+    // a supervisor-side JSONL file the sandbox never sees. Opened here
+    // so the filtered-egress proxy below can share the handle; the
+    // launch record itself is appended when the child exits.
+    let audit_log = if config.audit_log_enabled() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        audit::AuditLog::open(&home)
+    } else {
+        None
+    };
+    let launch_start = std::time::Instant::now();
+
     // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
     let guard = sandbox::prepare()?;
+
+    // Filtered egress: the CONNECT proxy runs as threads in this
+    // supervisor process. On Linux the sandbox reaches it through the
+    // bind-mounted Unix socket and the in-sandbox bridge; on macOS the
+    // child talks to its loopback TCP port directly (no netns there).
+    // The handle must outlive the child, so it stays bound for the rest
+    // of run() (dropping it unlinks the socket file).
+    #[cfg(target_os = "linux")]
+    let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
+    {
+        let mut proxy_config =
+            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        // Test-only escape hatch (tests/filtered_egress.rs): lets the
+        // end-to-end tests CONNECT to loopback fixtures, which the SSRF
+        // guard would otherwise refuse. Never documented; never set in
+        // normal operation.
+        proxy_config.danger_allow_private =
+            std::env::var_os("AI_JAIL_TEST_PROXY_ALLOW_PRIVATE").is_some();
+        // The audit handle is supervisor-side; the sandbox never sees
+        // the file it appends to.
+        proxy_config.audit = audit_log.clone();
+        let socket = proxy::default_socket_path();
+        let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
+            .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
+        Some(proxy)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
+    {
+        let mut proxy_config =
+            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        proxy_config.audit = audit_log.clone();
+        let proxy = proxy::Proxy::start(proxy_config, None)
+            .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
+        Some(proxy)
+    } else {
+        None
+    };
 
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
@@ -366,8 +514,13 @@ fn run() -> Result<i32, String> {
 
     // Handle dry run
     if cli.dry_run {
-        let formatted =
-            sandbox::dry_run(&guard, &config, &project_dir, cli.verbose)?;
+        let formatted = sandbox::dry_run(
+            &guard,
+            &config,
+            &project_dir,
+            cli.verbose,
+            egress_proxy.as_ref(),
+        )?;
         output::dry_run_line(&formatted);
         return Ok(0);
     }
@@ -461,6 +614,7 @@ fn run() -> Result<i32, String> {
         &project_dir,
         cli.verbose,
         sandbox_tty.as_deref(),
+        egress_proxy.as_ref(),
     )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
@@ -544,6 +698,36 @@ fn run() -> Result<i32, String> {
         code
     };
 
+    // Append the launch record only now: exit code and duration are
+    // what make it an audit trail rather than a log of intentions.
+    if let Some(log) = &audit_log {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let network = match config.network_mode() {
+            config::NetworkMode::Off => "off",
+            config::NetworkMode::Filtered => "filtered",
+            config::NetworkMode::Full => "full",
+        };
+        log.record(audit::launch_record(&audit::LaunchRecord {
+            command: &config.command,
+            network_mode: network,
+            allow_hosts: config.allow_hosts(),
+            lockdown: config.lockdown_enabled(),
+            agent_state: config.agent_state_enabled(),
+            gpu: config.gpu_enabled(),
+            display: config.display_enabled(),
+            audio: config.audio_enabled(),
+            browser_profile: config.browser_profile.as_deref(),
+            project_config: !cli.clean
+                && invocation_cwd.join(".ai-jail").is_file(),
+            project_trusted,
+            global_config: home.join(".ai-jail").exists(),
+            exit_code,
+            duration: launch_start.elapsed(),
+        }));
+    }
+
     // Guard is dropped here, cleaning up any temp files. On macOS the
     // guard is a unit struct (no temp files to clean), so the explicit
     // drop is a no-op there; clippy's drop_non_drop only fires on that
@@ -572,7 +756,7 @@ mod tests {
         prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
         running_inside_multiplexer, should_auto_save_project_config,
         should_check_update, should_save_global_preferences,
-        validate_write_flags,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -582,6 +766,55 @@ mod tests {
     fn crush_requires_direct_tty() {
         assert!(command_needs_direct_tty(&["crush".into()]));
         assert!(command_needs_direct_tty(&["/usr/bin/crush".into()]));
+    }
+
+    #[test]
+    fn allow_tcp_port_error_points_at_allow_host() {
+        let config = Config {
+            allow_tcp_ports: vec![443],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("--allow-tcp-port is disabled"));
+        assert!(error.contains("--allow-host"));
+    }
+
+    #[test]
+    fn network_and_allow_host_contradiction_hard_errors() {
+        let config = Config {
+            network: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn browser_and_allow_host_contradiction_hard_errors() {
+        let config = Config {
+            browser_profile: Some("hard".into()),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("--browser"));
+        assert!(error.contains("--allow-host"));
+    }
+
+    #[test]
+    fn allow_host_alone_and_with_lockdown_is_valid() {
+        let filtered = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&filtered).is_ok());
+        let locked = Config {
+            lockdown: Some(true),
+            ..filtered.clone()
+        };
+        assert!(validate_network_flags(&locked).is_ok());
+        assert!(validate_network_flags(&Config::default()).is_ok());
     }
 
     #[test]
